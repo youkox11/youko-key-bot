@@ -130,10 +130,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bridge = context.bot_data.get('discord_bridge')
         if settings.discord_configured:
             if not bridge or not await bridge.forward(url, message.chat_id, message.message_id):
-                await message.reply_text('⚠️ Discord relay is not ready. Check Discord bot login, channel access, and Render logs.')
+                await message.reply_text('⚠️ Discord message could not be confirmed. Check Render logs for channel, send or deletion details.')
             else:
                 await message.reply_text(
-                    '📨 Link forwarded to Discord. Waiting for a response.\n'
+                    '📨 Discord accepted the link. Check Render logs for the message URL. Waiting for a response.\n'
                     '⚠️ The other Discord bot may ignore bot-authored links. '
                     'Only a direct reply from the configured result bot can be returned here.'
                 )
