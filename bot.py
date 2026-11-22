@@ -1,10 +1,11 @@
-"""YOUKO AUTO KEY BOT V2 - Telegram bot entry point.
+"""YOUKO KEY BOT V3 - Telegram group/private links + optional Discord relay.
 
-Local (Windows):  long polling   (no WEBHOOK_BASE_URL set)
-Render:           webhook        (RENDER_EXTERNAL_URL is set by Render)
+Render: Telegram webhook. Local: Telegram long polling.
+Discord relay does NOT guarantee that another Discord bot will answer bot posts.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -13,212 +14,220 @@ import time
 
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import ConfigError, Settings, load_settings
 from providers import SERVICE_DOMAINS, Status, build_provider, url_fingerprint, validate_url
 
-log = logging.getLogger("youko")
-
-URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-
-START_TEXT = (
-    "🔑 <b>YOUKO KEY BOT</b>\n\n"
-    "Welcome! Send me a supported HTTPS link in this private chat and I will "
-    "check it and process it through an authorized provider API, if one is "
-    "configured.\n\n"
-    "Commands:\n"
-    "/help - show commands\n"
-    "/status - bot and API status\n"
-    "/supported - supported services"
-)
-
-HELP_TEXT = (
-    "<b>Commands</b>\n"
-    "/start - welcome message\n"
-    "/help - this help\n"
-    "/status - bot and API status\n"
-    "/supported - supported URL services\n\n"
-    "<b>Usage</b>\n"
-    "Send one HTTPS link per message, in a private chat with me."
-)
-
+log = logging.getLogger('youko')
+URL_RE = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
 
 class RateLimiter:
-    """Simple per-user cooldown."""
-
     def __init__(self, seconds: int) -> None:
-        self._seconds = seconds
-        self._last: dict[int, float] = {}
+        self.seconds = seconds
+        self.last: dict[int, float] = {}
 
     def remaining(self, user_id: int) -> int:
         now = time.monotonic()
-        if len(self._last) > 5000:  # keep memory bounded
-            self._last = {u: t for u, t in self._last.items() if now - t < self._seconds}
-        last = self._last.get(user_id)
-        if last is None:
-            return 0
-        return max(0, int(self._seconds - (now - last) + 0.999))
+        if len(self.last) > 5000:
+            self.last = {k: v for k, v in self.last.items() if now - v < self.seconds}
+        return max(0, int(self.seconds - (now - self.last.get(user_id, -1e10)) + .999))
 
     def hit(self, user_id: int) -> None:
-        self._last[user_id] = time.monotonic()
+        self.last[user_id] = time.monotonic()
+
+
+def allowed_chat(update: Update, settings: Settings) -> bool:
+    chat = update.effective_chat
+    if chat is None:
+        return False
+    return chat.type == ChatType.PRIVATE or (chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id == settings.telegram_group_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
+    settings: Settings = context.bot_data['settings']
+    if not allowed_chat(update, settings):
+        return
+    await update.effective_message.reply_text(
+        '🔑 YOUKO KEY BOT V3\n\nSend a supported HTTPS link. '
+        'In the configured Telegram group, links can be relayed to Discord.\n'
+        'Commands: /help /status /supported /chatid'
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    if not allowed_chat(update, context.bot_data['settings']):
+        return
+    await update.effective_message.reply_text(
+        'Commands:\n/start - welcome\n/help - help\n/status - integration status\n'
+        '/supported - allowed link domains\n/chatid - this Telegram chat ID\n\n'
+        'Send one HTTPS link per message. Group links are processed only in TELEGRAM_GROUP_ID.\n'
+        'Discord result relay requires a DIRECT REPLY from the configured result bot to the forwarded Discord message.'
+    )
+
+
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat:
+        await update.effective_message.reply_text(f'Telegram Chat ID: {chat.id}')
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.bot_data["settings"]
-    provider = context.bot_data["provider"]
-    mode = "webhook" if settings.use_webhook else "long polling"
-    api = "configured ✅" if provider.configured else "not configured ⚠️"
-    text = (
-        "<b>YOUKO KEY BOT status</b>\n"
-        "Bot: online ✅\n"
-        f"Mode: {mode}\n"
-        f"Authorized key API: {api}\n"
-        f"Rate limit: 1 request / {settings.rate_limit_seconds}s per user"
+    settings: Settings = context.bot_data['settings']
+    if not allowed_chat(update, settings):
+        return
+    bridge = context.bot_data.get('discord_bridge')
+    discord_status = ('ready ✅' if bridge and bridge.is_ready() else 'not ready ⚠️') if settings.discord_configured else 'not configured'
+    await update.effective_message.reply_text(
+        f'YOUKO KEY BOT V3\nTelegram: online ✅\n'
+        f'Mode: {"webhook" if settings.use_webhook else "polling"}\n'
+        f'Telegram group: {"configured" if settings.telegram_group_id else "not configured"}\n'
+        f'Discord relay: {discord_status}\n'
+        f'Authorized provider API: {"configured" if settings.provider_configured else "not configured"}\n'
+        f'Cooldown: {settings.rate_limit_seconds}s per user'
     )
-    if not provider.configured:
-        text += "\n\nLink validation works. Automatic key retrieval is unavailable until an authorized API is configured."
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def supported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    lines = ["<b>Supported URL services</b>"]
-    for service, domains in SERVICE_DOMAINS.items():
-        lines.append(f"• {html.escape(service)}: " + ", ".join(html.escape(d) for d in domains))
-    lines.append("\nLinks must start with https://")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    if not allowed_chat(update, context.bot_data['settings']):
+        return
+    lines = ['<b>Supported URL services</b>']
+    for name, domains in SERVICE_DOMAINS.items():
+        lines.append(f'• {html.escape(name)}: ' + ', '.join(map(html.escape, domains)))
+    await update.effective_message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-    if message is None or user is None or chat is None or not message.text:
+    message, user = update.effective_message, update.effective_user
+    settings: Settings = context.bot_data['settings']
+    if not message or not user or not message.text or not allowed_chat(update, settings):
         return
-
     match = URL_RE.search(message.text)
-
-    # Privacy: only handle links in private chats so results are never public.
-    if chat.type != ChatType.PRIVATE:
-        if match:
-            await message.reply_text("For your privacy, please send links to me in a private chat.")
-        return
-
     if not match:
-        await message.reply_text("Please send a link that starts with https://\nUse /help for commands.")
+        # Avoid spamming groups on regular conversation.
+        if update.effective_chat.type == ChatType.PRIVATE:
+            await message.reply_text('Send a supported HTTPS link. Use /supported for the list.')
         return
-
-    url = match.group(0).rstrip(".,;:!?)]}")
+    url = match.group(0).rstrip('.,;:!?)]}')
     check = validate_url(url)
     if not check.ok:
-        await message.reply_text(f"❌ {check.error}")
+        await message.reply_text(f'❌ {check.error}')
         return
 
-    provider = context.bot_data["provider"]
-    if not provider.configured:
-        await message.reply_text(
-            f"✅ Valid {check.service} link recognized.\n\n"
-            "ℹ️ Automatic key retrieval is unavailable because no authorized "
-            "provider API is configured."
-        )
-        return
-
-    in_flight: set[int] = context.bot_data["in_flight"]
+    limiter: RateLimiter = context.bot_data['limiter']
+    in_flight: set[int] = context.bot_data['in_flight']
     if user.id in in_flight:
-        await message.reply_text("⏳ Your previous request is still processing. Please wait.")
+        await message.reply_text('⏳ Your previous request is still processing.')
         return
-
-    limiter: RateLimiter = context.bot_data["limiter"]
     wait = limiter.remaining(user.id)
     if wait:
-        await message.reply_text(f"⏱ Please wait {wait}s before sending another link.")
+        await message.reply_text(f'⏱ Wait {wait}s before another request.')
         return
-
-    in_flight.add(user.id)
     limiter.hit(user.id)
-    log.info("Request user=%s service=%s link=%s", user.id, check.service, url_fingerprint(url))
+    in_flight.add(user.id)
+    log.info('Request service=%s fingerprint=%s', check.service, url_fingerprint(url))
     try:
-        progress = await message.reply_text(f"⏳ Processing your {check.service} link...")
-        result = await provider.fetch_key(check.service, url)
+        bridge = context.bot_data.get('discord_bridge')
+        if settings.discord_configured:
+            if not bridge or not await bridge.forward(url, message.chat_id, message.message_id):
+                await message.reply_text('⚠️ Discord relay is not ready. Check Discord bot login, channel access, and Render logs.')
+            else:
+                await message.reply_text(
+                    '📨 Link forwarded to Discord. Waiting for a response.\n'
+                    '⚠️ The other Discord bot may ignore bot-authored links. '
+                    'Only a direct reply from the configured result bot can be returned here.'
+                )
+            return
 
-        if result.status is Status.COMPLETED and result.key:
-            text = (
-                "🔑 <b>YOUKO KEY BOT</b>\n\n"
-                "✅ <b>Key Ready!</b>\n\n"
-                f"<code>{html.escape(result.key)}</code>"
+        provider = context.bot_data['provider']
+        if not provider.configured:
+            await message.reply_text(
+                f'✅ Valid {check.service} link recognized.\n\n'
+                '⚠️ Neither Discord relay nor an authorized provider API is configured. No key can be retrieved.'
             )
+            return
+        progress = await message.reply_text(f'⏳ Processing {check.service} through the authorized API...')
+        result = await provider.fetch_key(check.service, url)
+        if result.status is Status.COMPLETED and result.key:
+            response = f'🔑 <b>Key Ready</b>\n<code>{html.escape(result.key)}</code>'
         else:
-            text = f"❌ Unable to retrieve a key.\n\nReason: {html.escape(result.reason)}"
-        await progress.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception as exc:  # noqa: BLE001 - never leak details to users
-        log.error("Handler error %s", type(exc).__name__)
-        await message.reply_text("❌ Unable to retrieve a key.\n\nReason: Unexpected error. Please try again later.")
+            response = f'❌ No key available.\nReason: {html.escape(result.reason)}'
+        await progress.edit_text(response, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        log.error('Request error: %s', type(exc).__name__)
+        await message.reply_text('❌ Unexpected error. Check the bot logs.')
     finally:
         in_flight.discard(user.id)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Log only the exception type: messages can contain URLs/tokens.
-    log.error("Unhandled error: %s", type(context.error).__name__)
+    log.error('Unhandled error: %s', type(context.error).__name__)
+
+
+async def post_init(app: Application) -> None:
+    settings: Settings = app.bot_data['settings']
+    if not settings.discord_configured:
+        return
+    from discord_bridge import DiscordBridge
+
+    async def return_result(chat_id: int, message_id: int, result: str) -> None:
+        await app.bot.send_message(
+            chat_id=chat_id, text='📩 Discord result:\n\n' + result,
+            reply_to_message_id=message_id, allow_sending_without_reply=True,
+            disable_web_page_preview=True,
+        )
+
+    bridge = DiscordBridge(
+        settings.discord_channel_id, settings.discord_result_bot_id,
+        settings.discord_result_timeout, return_result,
+    )
+    app.bot_data['discord_bridge'] = bridge
+    task = asyncio.create_task(bridge.start(settings.discord_bot_token), name='discord-relay')
+    app.bot_data['discord_task'] = task
+    task.add_done_callback(lambda t: log.error('Discord relay exited: %s', type(t.exception()).__name__ if not t.cancelled() and t.exception() else 'stopped'))
+
+
+async def post_shutdown(app: Application) -> None:
+    bridge = app.bot_data.get('discord_bridge')
+    if bridge:
+        await bridge.close()
+    task = app.bot_data.get('discord_task')
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
     try:
         settings = load_settings()
     except ConfigError as exc:
-        print(f"\n{exc}\n", file=sys.stderr)
+        print(exc, file=sys.stderr)
         sys.exit(1)
-
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        level=getattr(logging, settings.log_level, logging.INFO),
-    )
-    # httpx logs full request URLs (which contain the bot token) at INFO.
-    for noisy in ("httpx", "httpcore", "telegram", "apscheduler"):
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(name)s: %(message)s', level=getattr(logging, settings.log_level, logging.INFO))
+    for noisy in ('httpx', 'httpcore', 'telegram', 'discord.gateway'):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    app = Application.builder().token(settings.bot_token).build()
-    app.bot_data["settings"] = settings
-    app.bot_data["provider"] = build_provider(settings)
-    app.bot_data["limiter"] = RateLimiter(settings.rate_limit_seconds)
-    app.bot_data["in_flight"] = set()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("supported", supported))
+    app = Application.builder().token(settings.bot_token).post_init(post_init).post_shutdown(post_shutdown).build()
+    app.bot_data.update(settings=settings, provider=build_provider(settings), limiter=RateLimiter(settings.rate_limit_seconds), in_flight=set())
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('help', help_cmd))
+    app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('supported', supported))
+    app.add_handler(CommandHandler('chatid', chatid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
-
     if settings.use_webhook:
-        log.info("Starting in webhook mode on port %s", settings.port)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=settings.port,
-            url_path="telegram",
-            webhook_url=f"{settings.webhook_base_url}/telegram",
-            secret_token=settings.webhook_secret,
-            allowed_updates=[Update.MESSAGE],
-            drop_pending_updates=True,
-        )
+        log.info('Starting Telegram webhook on port %s', settings.port)
+        app.run_webhook(listen='0.0.0.0', port=settings.port, url_path='telegram',
+                        webhook_url=f'{settings.webhook_base_url}/telegram',
+                        secret_token=settings.webhook_secret,
+                        allowed_updates=[Update.MESSAGE], drop_pending_updates=True)
     else:
-        log.info("Starting in long-polling mode")
+        log.info('Starting Telegram polling')
         app.run_polling(allowed_updates=[Update.MESSAGE], drop_pending_updates=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
