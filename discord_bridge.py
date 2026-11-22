@@ -1,8 +1,8 @@
-"""Optional Discord relay.
+"""YOUKO KEY BOT V3 - optional Discord relay.
 
-Sends links as the configured Discord bot. Can relay a response ONLY when the
-configured result bot replies directly to that message. Other bots may ignore
-bot-authored messages, so this cannot guarantee a Linkhive response.
+Forwards links using a Discord bot account and returns responses from a
+configured result bot only when they explicitly reply to a forwarded message.
+This does NOT bypass Discord's bot-to-bot restrictions or invoke slash commands.
 """
 from __future__ import annotations
 
@@ -13,73 +13,150 @@ from typing import Awaitable, Callable
 
 import discord
 
-log = logging.getLogger('youko.discord')
+log = logging.getLogger("youko.discord")
+
 
 @dataclass
 class Pending:
     telegram_chat_id: int
     telegram_message_id: int
     expires_at: float
+    last_result: str = ""
+
 
 class DiscordBridge(discord.Client):
-    def __init__(self, channel_id: int, result_bot_id: int, timeout_seconds: int,
-                 on_result: Callable[[int, int, str], Awaitable[None]]) -> None:
+    def __init__(
+        self,
+        channel_id: int,
+        result_bot_id: int,
+        timeout_seconds: int,
+        on_result: Callable[[int, int, str], Awaitable[None]],
+    ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
-        self.channel_id = channel_id
-        self.result_bot_id = result_bot_id
-        self.timeout_seconds = timeout_seconds
+        self.channel_id = int(channel_id)
+        self.result_bot_id = int(result_bot_id)
+        self.timeout_seconds = max(10, int(timeout_seconds))
         self.on_result = on_result
         self.pending: dict[int, Pending] = {}
+        # Tracks result messages, including those later edited by the result bot.
+        self.result_to_request: dict[int, int] = {}
 
     async def on_ready(self) -> None:
-        log.info('Discord relay ready (bot ID=%s)', self.user.id if self.user else 'unknown')
+        log.info("Discord relay ready (bot ID=%s)", self.user.id if self.user else "unknown")
 
     async def forward(self, url: str, chat_id: int, message_id: int) -> bool:
         if not self.is_ready():
+            log.warning("Discord relay is not ready")
             return False
         channel = self.get_channel(self.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                log.warning("Discord channel cannot be fetched")
+                return False
         if not isinstance(channel, discord.TextChannel):
-            log.warning('Discord channel unavailable or not a text channel')
+            log.warning("Configured Discord channel is not a text channel")
             return False
         try:
-            sent = await channel.send(url, allowed_mentions=discord.AllowedMentions.none())
+            sent = await channel.send(
+                url,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except (discord.Forbidden, discord.HTTPException):
-            log.warning('Could not send message to Discord channel')
+            log.warning("Discord message send failed")
             return False
         self._prune()
-        self.pending[sent.id] = Pending(chat_id, message_id, time.monotonic() + self.timeout_seconds)
+        self.pending[sent.id] = Pending(
+            telegram_chat_id=chat_id,
+            telegram_message_id=message_id,
+            expires_at=time.monotonic() + self.timeout_seconds,
+        )
+        log.info("Forwarded request to Discord (message ID=%s)", sent.id)
         return True
 
     def _prune(self) -> None:
         now = time.monotonic()
         self.pending = {k: v for k, v in self.pending.items() if v.expires_at > now}
+        self.result_to_request = {
+            result_id: request_id
+            for result_id, request_id in self.result_to_request.items()
+            if request_id in self.pending
+        }
         if len(self.pending) > 1000:
             self.pending = dict(list(self.pending.items())[-1000:])
+            self.result_to_request = {
+                result_id: request_id
+                for result_id, request_id in self.result_to_request.items()
+                if request_id in self.pending
+            }
 
-    async def on_message(self, message: discord.Message) -> None:
-        if message.channel.id != self.channel_id or message.author.id != self.result_bot_id:
-            return
-        if not message.reference or not message.reference.message_id:
-            return
-        self._prune()
-        pending = self.pending.pop(message.reference.message_id, None)
-        if pending is None:
-            return
-        pieces = [message.content.strip()] if message.content.strip() else []
-        for embed in message.embeds[:2]:
+    @staticmethod
+    def _extract_result(message: discord.Message) -> str:
+        pieces: list[str] = []
+        if message.content.strip():
+            pieces.append(message.content.strip())
+        for embed in message.embeds[:5]:
             if embed.title:
                 pieces.append(embed.title)
             if embed.description:
                 pieces.append(embed.description)
-            for field in embed.fields[:5]:
-                pieces.append(f'{field.name}: {field.value}')
-        result = '\n'.join(pieces).strip()
-        if not result:
-            result = 'Discord replied, but no readable text was provided.'
-        # Discord responses are untrusted: forward as plain text, not Markdown/HTML.
+            if embed.url:
+                pieces.append(embed.url)
+            for field in embed.fields[:10]:
+                pieces.append(f"{field.name}: {field.value}")
+            if embed.footer and embed.footer.text:
+                pieces.append(embed.footer.text)
+        # discord.py 2.x exposes action-row buttons in message.components.
+        for row in message.components:
+            for component in getattr(row, "children", []):
+                link = getattr(component, "url", None)
+                if link and isinstance(link, str) and link.startswith("https://"):
+                    label = getattr(component, "label", None) or "Result link"
+                    pieces.append(f"{label}: {link}")
+        return "\n".join(pieces).strip()[:3500]
+
+    async def _handle_result(self, message: discord.Message) -> None:
+        if message.channel.id != self.channel_id:
+            return
+        if message.author.id != self.result_bot_id:
+            return
+        self._prune()
+        request_id = self.result_to_request.get(message.id)
+        if request_id is None and message.reference is not None:
+            request_id = message.reference.message_id
+        if request_id is None or request_id not in self.pending:
+            log.debug("Unmatched result bot message (ID=%s)", message.id)
+            return
+        pending = self.pending[request_id]
+        self.result_to_request[message.id] = request_id
+        result = self._extract_result(message)
+        if not result or result == pending.last_result:
+            return
+        # Ignore progress-only messages; keep pending until a later edit/reply.
+        lower = result.lower()
+        if any(word in lower for word in ("processing", "please wait", "working on it", "bypassing...", "queued", "in progress")) and not any(word in lower for word in ("success", "completed", "failed", "error")):
+            log.info("Discord result still processing (message ID=%s)", message.id)
+            return
         try:
-            await self.on_result(pending.telegram_chat_id, pending.telegram_message_id, result[:3500])
+            await self.on_result(
+                pending.telegram_chat_id,
+                pending.telegram_message_id,
+                result,
+            )
         except Exception as exc:
-            log.error('Telegram relay failed: %s', type(exc).__name__)
+            log.error("Telegram result delivery failed: %s", type(exc).__name__)
+            return
+        pending.last_result = result
+        # Once a terminal response has been delivered, stop tracking the request.
+        self.pending.pop(request_id, None)
+        self.result_to_request.pop(message.id, None)
+        log.info("Discord result delivered for request ID=%s", request_id)
+
+    async def on_message(self, message: discord.Message) -> None:
+        await self._handle_result(message)
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        await self._handle_result(after)
