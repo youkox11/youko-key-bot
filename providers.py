@@ -1,8 +1,14 @@
-"""URL validation and integration with an operator-authorized HTTPS API.
+"""URL validation and authorized key-provider integration.
 
-The provider must be used only for requests permitted by its terms. It does
-not solve CAPTCHAs, simulate authorization, or invent keys. The provider API
-must return an actual key for this module to report success.
+This module does NOT bypass, skip, or automate any ad, CAPTCHA, anti-bot, or
+key-authorization system. It only:
+
+1. validates that a user-supplied link is a well-formed HTTPS link on a
+   recognised service domain, and
+2. forwards it to ONE operator-configured API that you are authorized to use,
+   then reads the result that API legitimately returns.
+
+If no such API is configured, no key is ever produced.
 """
 from __future__ import annotations
 
@@ -19,6 +25,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Recognised link domains (edit as needed). A host matches if it equals a
+# domain or is a subdomain of it.
 SERVICE_DOMAINS: dict[str, tuple[str, ...]] = {
     "LootLabs": (
         "lootlabs.gg", "loot-link.com", "loot-links.com",
@@ -30,11 +38,15 @@ SERVICE_DOMAINS: dict[str, tuple[str, ...]] = {
         "up-to-down.net", "link-center.net", "link-hub.net",
     ),
 }
+
 MAX_URL_LENGTH = 2048
 _KEY_RE = re.compile(r"^[A-Za-z0-9_\-.:=+/]{4,256}$")
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+# --------------------------------------------------------------------------
+# URL validation
+# --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ValidationResult:
     ok: bool
@@ -47,6 +59,7 @@ def _host_matches(host: str, domain: str) -> bool:
 
 
 def validate_url(raw: str) -> ValidationResult:
+    """Validate a user-supplied URL. Never fetches it."""
     if len(raw) > MAX_URL_LENGTH:
         return ValidationResult(False, error="That link is too long.")
     try:
@@ -54,12 +67,14 @@ def validate_url(raw: str) -> ValidationResult:
         port = parsed.port
     except ValueError:
         return ValidationResult(False, error="That link is not valid.")
+
     if parsed.scheme != "https":
         return ValidationResult(False, error="Only HTTPS links are accepted.")
     if parsed.username or parsed.password:
         return ValidationResult(False, error="Links with credentials are not accepted.")
     if port not in (None, 443):
         return ValidationResult(False, error="Custom ports are not accepted.")
+
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return ValidationResult(False, error="That link has no host name.")
@@ -68,16 +83,21 @@ def validate_url(raw: str) -> ValidationResult:
         return ValidationResult(False, error="IP-address links are not accepted.")
     except ValueError:
         pass
+
     for service, domains in SERVICE_DOMAINS.items():
-        if any(_host_matches(host, domain) for domain in domains):
+        if any(_host_matches(host, d) for d in domains):
             return ValidationResult(True, service=service)
     return ValidationResult(False, error="Unsupported service. Use /supported to see the list.")
 
 
 def url_fingerprint(url: str) -> str:
+    """Short hash used in logs instead of the private URL."""
     return hashlib.sha256(url.encode()).hexdigest()[:10]
 
 
+# --------------------------------------------------------------------------
+# Results
+# --------------------------------------------------------------------------
 class Status(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
@@ -92,12 +112,20 @@ class KeyResult:
     reason: str = "Provider unavailable or unsupported."
 
 
+# --------------------------------------------------------------------------
+# Providers
+# --------------------------------------------------------------------------
 class NoProvider:
+    """Used when no authorized API is configured. Never returns a key."""
+
     name = "none"
     configured = False
 
     async def fetch_key(self, service: str, url: str) -> KeyResult:
-        return KeyResult(Status.UNAVAILABLE, reason="Automatic key retrieval is not configured.")
+        return KeyResult(
+            Status.UNAVAILABLE,
+            reason="Automatic key retrieval is not configured.",
+        )
 
 
 @dataclass
@@ -108,13 +136,16 @@ class _Outcome:
 
 
 class AuthorizedApiProvider:
-    """Provider client compatible with the existing bot.py/config.py interface.
+    """Client for ONE operator-configured, authorized HTTPS API.
 
-    Sends POST {api_url} with x-api-key and {"url": ...}, based on the
-    example supplied by the user. The API response schema has NOT been
-    verified; only an explicit, valid `key` field is accepted as a key.
-    Pending-job polling is supported only if the API supplies a job_id and
-    implements GET {api_url}/{job_id}.
+    Expected API contract (see README):
+      POST {api_url}            body: {"service": "...", "url": "..."}
+      GET  {api_url}/{job_id}   (only if the POST answered "pending")
+    Response JSON: {"status": "pending|completed|failed",
+                    "job_id": "...", "key": "..."}
+
+    Outgoing requests are restricted to the configured host; redirects are
+    never followed, so the bot cannot be steered to another host (no SSRF).
     """
 
     name = "authorized-api"
@@ -131,96 +162,63 @@ class AuthorizedApiProvider:
 
     def _assert_allowed(self, url: str) -> None:
         parsed = urlparse(url)
-        if (parsed.scheme != "https" or
-                (parsed.hostname or "").lower() != self._host or
-                parsed.username or parsed.password or
-                parsed.port not in (None, 443)):
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != self._host:
             raise ValueError("Outgoing request blocked: host is not approved.")
 
     def _interpret(self, resp: httpx.Response) -> _Outcome:
-        code = resp.status_code
-        if code == 429:
-            log.warning("Provider rate limit: HTTP 429")
-            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider rate limit (HTTP 429). Try later."))
-        if code not in (200, 201, 202):
-            log.warning("Provider request rejected: HTTP %s", code)
-            if code in (401, 403):
-                reason = f"Provider authentication/permission error (HTTP {code})."
-            elif code in (400, 422):
-                reason = f"Provider rejected request format or URL (HTTP {code})."
-            elif code >= 500:
-                reason = f"Provider server error (HTTP {code})."
-            else:
-                reason = f"Provider HTTP {code}."
-            return _Outcome(result=KeyResult(Status.FAILED, reason=reason))
-
+        if resp.status_code == 429:
+            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider is rate limiting requests. Try again later."))
+        if resp.status_code not in (200, 201, 202):
+            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider returned an error."))
         try:
             data = resp.json()
         except ValueError:
-            log.warning("Provider returned non-JSON response (HTTP %s)", code)
-            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider returned non-JSON data."))
+            data = None
         if not isinstance(data, dict):
-            return _Outcome(result=KeyResult(Status.FAILED, reason="Unexpected provider response format."))
+            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider returned an unexpected response."))
 
         status = str(data.get("status", "")).lower()
         job_id = data.get("job_id")
-        job_id = job_id if isinstance(job_id, str) and _JOB_ID_RE.fullmatch(job_id) else None
+        job_id = job_id if isinstance(job_id, str) and _JOB_ID_RE.match(job_id) else None
+
         if status in ("pending", "processing", "queued"):
             return _Outcome(pending=True, job_id=job_id)
-        if status in ("failed", "error") or data.get("success") is False:
-            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider reported failure."))
-
-        # Do not confuse a resolved destination URL with an actual key.
-        key = data.get("key")
-        if status in ("completed", "success", "ok") and isinstance(key, str) and _KEY_RE.fullmatch(key):
-            return _Outcome(result=KeyResult(Status.COMPLETED, key=key))
-        if isinstance(data.get("url"), str) or isinstance(data.get("destination"), str):
-            return _Outcome(result=KeyResult(
-                Status.FAILED,
-                reason="Provider returned a destination URL, not a key. Check its API response schema.",
-            ))
-        log.warning("Provider JSON schema differs from expected fields; HTTP %s", code)
-        return _Outcome(result=KeyResult(
-            Status.FAILED,
-            reason="Provider response schema is not supported; check API documentation.",
-        ))
+        if status == "completed":
+            key = data.get("key")
+            if isinstance(key, str) and _KEY_RE.match(key):
+                return _Outcome(result=KeyResult(Status.COMPLETED, key=key))
+            return _Outcome(result=KeyResult(Status.FAILED, reason="Provider did not return a valid key."))
+        return _Outcome(result=KeyResult(Status.FAILED, reason="Provider could not complete this request."))
 
     async def fetch_key(self, service: str, url: str) -> KeyResult:
-        validation = validate_url(url)
-        if not validation.ok or validation.service != service:
-            return KeyResult(Status.FAILED, reason=validation.error or "Link service mismatch.")
         fp = url_fingerprint(url)
-        headers = {
-            "x-api-key": self._token,
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
         try:
             async with asyncio.timeout(self._job_timeout):
                 async with httpx.AsyncClient(
-                    timeout=self._request_timeout,
-                    follow_redirects=False,
-                    headers=headers,
+                    timeout=self._request_timeout, follow_redirects=False, headers=headers
                 ) as client:
                     self._assert_allowed(self._api_url)
-                    response = await client.post(self._api_url, json={"url": url})
-                    outcome = self._interpret(response)
+                    resp = await client.post(self._api_url, json={"service": service, "url": url})
+                    outcome = self._interpret(resp)
                     job_id = outcome.job_id
+
                     while outcome.pending:
                         if not job_id:
-                            return KeyResult(Status.FAILED, reason="Provider returned pending without a job reference.")
+                            return KeyResult(Status.FAILED, reason="Provider did not return a job reference.")
                         await asyncio.sleep(self._poll_interval)
                         poll_url = f"{self._api_url}/{job_id}"
                         self._assert_allowed(poll_url)
                         outcome = self._interpret(await client.get(poll_url))
                         job_id = outcome.job_id or job_id
+
                     return outcome.result or KeyResult(Status.FAILED)
         except (TimeoutError, httpx.TimeoutException):
             log.warning("Provider timeout (link=%s)", fp)
-            return KeyResult(Status.TIMEOUT, reason="Provider timed out.")
+            return KeyResult(Status.TIMEOUT, reason="The provider took too long to respond.")
         except (httpx.HTTPError, ValueError) as exc:
-            log.warning("Provider network/config error %s (link=%s)", type(exc).__name__, fp)
-            return KeyResult(Status.FAILED, reason="Provider network or configuration error.")
+            log.warning("Provider error %s (link=%s)", type(exc).__name__, fp)
+            return KeyResult(Status.FAILED)
 
 
 def build_provider(settings) -> NoProvider | AuthorizedApiProvider:
